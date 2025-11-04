@@ -118,6 +118,89 @@ def load_model():
         st.error(f"No se pudo cargar el modelo desde {MODEL_PATH}.\nDetalle: {e}")
         raise
 
+# === introspección del modelo para saber columnas y categorías ===
+def infer_features_from_model(m):
+    """
+    Devuelve: (num_cols, cat_cols, airlines, dow_categories)
+    """
+    if "preprocess" not in m.named_steps:
+        st.error("El modelo no tiene paso 'preprocess'.")
+        st.stop()
+
+    ct = m.named_steps["preprocess"]
+    transformers = dict(ct.transformers_)
+    cat_cols = transformers["cat"][2]
+    num_cols = transformers["num"][2]
+
+    cat_pipe = transformers["cat"][1]
+    oh = cat_pipe.named_steps["onehot"]
+
+    # categorías de aerolíneas
+    idx_airline = cat_cols.index("main_airline")
+    airlines = list(oh.categories_[idx_airline])
+
+    # categorías de flight_dayofweek (¿'Mon'..'Sun' o 0..6?)
+    idx_dow = cat_cols.index("flight_dayofweek")
+    dow_categories = list(oh.categories_[idx_dow])
+
+    return num_cols, cat_cols, airlines, dow_categories
+
+# Cargá el modelo y obtené la “firma” que espera
+model = load_model()
+num_cols, cat_cols, airlines_from_model, dow_categories = infer_features_from_model(model)
+
+def normalize_dow_value(date, dow_categories):
+    """
+    Devuelve flight_dayofweek en el mismo formato que el entrenamiento.
+    Si el modelo fue entrenado con strings ('Mon'), devolvemos eso; si fue con 0..6, devolvemos int.
+    """
+    sample = dow_categories[0]
+    if isinstance(sample, str):
+        return date.strftime("%a")  # 'Mon', 'Tue', ...
+    else:
+        return date.weekday()       # 0..6
+
+# === construir exactamente la fila de features que el modelo espera ===
+def build_features(origin, dest, flight_date, cabin_value, airline_code, is_refundable, nonstop):
+    # Nota: cabin_value NO se usa porque tu modelo v2 se entrenó sólo con coach
+    today = dt.date.today()
+    days_to_departure = max((flight_date - today).days, 0)
+
+    distance = route_distance_km(origin, dest)
+    duration = estimate_duration_min(distance, nonstop=nonstop)
+
+    flight_month = flight_date.month
+    flight_day = flight_date.day
+    flight_dayofweek = normalize_dow_value(flight_date, dow_categories)
+    is_weekend = int(flight_date.weekday() in (5, 6))
+    is_holiday_season = int(flight_month in (6, 7))  # regla usada en el training
+
+    row = {
+        "days_to_departure": days_to_departure,
+        "totalTravelDistance": distance,
+        "duration_min": duration,
+        "startingAirport": origin,
+        "destinationAirport": dest,
+        "isRefundable": int(is_refundable),
+        "isNonStop": int(nonstop),
+        "main_airline": airline_code,
+        "flight_month": flight_month,
+        "flight_dayofweek": flight_dayofweek,
+        "flight_day": flight_day,
+        "is_weekend": is_weekend,
+        "is_holiday_season": is_holiday_season,
+    }
+    X = pd.DataFrame([row])
+
+    # Orden exacto de columnas que espera el ColumnTransformer
+    expected = list(num_cols) + list(cat_cols)
+    missing = [c for c in expected if c not in X.columns]
+    if missing:
+        st.error(f"Faltan columnas para el modelo: {missing}")
+        st.stop()
+    return X[expected]
+
+
 def haversine_distance_km(lat1, lon1, lat2, lon2):
     R = 6371.0
     phi1 = math.radians(lat1)
@@ -193,6 +276,31 @@ def format_currency(x: float) -> str:
     except Exception:
         return str(x)
 
+def infer_features_from_model(m):
+    """
+    Devuelve: (num_cols, cat_cols, airlines, dow_categories)
+    """
+    if "preprocess" not in m.named_steps:
+        st.error("El modelo no tiene paso 'preprocess'.")
+        st.stop()
+
+    ct = m.named_steps["preprocess"]
+    transformers = dict(ct.transformers_)
+    cat_cols = transformers["cat"][2]
+    num_cols = transformers["num"][2]
+
+    cat_pipe = transformers["cat"][1]
+    oh = cat_pipe.named_steps["onehot"]
+
+    # categorías de aerolíneas
+    idx_airline = cat_cols.index("main_airline")
+    airlines = list(oh.categories_[idx_airline])
+
+    # categorías de flight_dayofweek (para saber si espera 'Mon' o 0..6)
+    idx_dow = cat_cols.index("flight_dayofweek")
+    dow_categories = list(oh.categories_[idx_dow])
+
+    return num_cols, cat_cols, airlines, dow_categories
 # =======================
 # UI
 # =======================
@@ -355,33 +463,8 @@ if cta:
 else:
     st.caption("Elegí ruta, fechas y opciones. Luego presioná **Explorar** para estimar precios.")
 
-def infer_features_from_model(m):
-    """
-    Devuelve: (num_cols, cat_cols, airlines, dow_categories)
-    """
-    if "preprocess" not in m.named_steps:
-        st.error("El modelo no tiene paso 'preprocess'.")
-        st.stop()
 
-    ct = m.named_steps["preprocess"]
-    transformers = dict(ct.transformers_)
-    cat_cols = transformers["cat"][2]
-    num_cols = transformers["num"][2]
-
-    cat_pipe = transformers["cat"][1]
-    oh = cat_pipe.named_steps["onehot"]
-
-    # categorías de aerolíneas
-    idx_airline = cat_cols.index("main_airline")
-    airlines = list(oh.categories_[idx_airline])
-
-    # categorías de flight_dayofweek (para saber si espera 'Mon' o 0..6)
-    idx_dow = cat_cols.index("flight_dayofweek")
-    dow_categories = list(oh.categories_[idx_dow])
-
-    return num_cols, cat_cols, airlines, dow_categories
-
-num_cols, cat_cols, airlines_from_model, dow_categories = infer_features_from_model(modelo)
+num_cols, cat_cols, airlines_from_model, dow_categories = infer_features_from_model(model)
 
 def normalize_dow_value(date, dow_categories):
     """
