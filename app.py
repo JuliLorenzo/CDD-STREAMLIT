@@ -1,8 +1,9 @@
-
+# app.py
 import os
 import math
 import datetime as dt
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import altair as alt
@@ -18,28 +19,16 @@ BASE_DIR = Path(__file__).parent if "__file__" in globals() else Path(".")
 MODEL_PATH = BASE_DIR / "models" / "random_forest_flights_v2.pkl"
 MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-DRIVE_ID = st.secrets.get("DRIVE_ID", None)
+DRIVE_ID = st.secrets.get("DRIVE_ID", None)  # definido en .streamlit/secrets.toml
 DRIVE_URL = f"https://drive.google.com/uc?id={DRIVE_ID}" if DRIVE_ID else None
 
-# Only allow these origins (per requirement)
+# Orígenes permitidos en la UI (en tu caso trabajás con JFK/MIA)
 ORIGINS = ["JFK", "MIA"]
 
-# Allowed destinations (including MIA/JFK)
+# Destinos permitidos (incluye MIA/JFK para ida y vuelta)
 DESTS = ["ATL","BOS","CLT","DEN","DFW","DTW","IAD","LAX","MIA","OAK","ORD","PHL","SFO","EWR","JFK","LGA"]
 
-# Minimal airline codes seen commonly in the US domestic market.
-AIRLINES = {
-    "AA - American": "AA",
-    "DL - Delta": "DL",
-    "UA - United": "UA",
-    "B6 - JetBlue": "B6",
-    "NK - Spirit": "NK",
-    "F9 - Frontier": "F9",
-    "WN - Southwest": "WN",
-    "AS - Alaska": "AS",
-}
-
-# Cabin UX labels -> model values
+# Etiquetas de cabina para la UI (tu modelo v2 se entrenó sólo con coach; no afecta la predicción)
 CABINS = {
     "Turista (Economy)": "coach",
     "Premium Economy": "premium coach",
@@ -47,7 +36,7 @@ CABINS = {
     "First": "first",
 }
 
-# Airport approximate coordinates (lat, lon) for distance calc (haversine)
+# Coordenadas aproximadas (lat, lon) para cálculo de distancia (haversine)
 AIRPORT_COORDS = {
     "ATL": (33.6407, -84.4277),
     "BOS": (42.3656, -71.0096),
@@ -68,20 +57,18 @@ AIRPORT_COORDS = {
 }
 
 # =======================
-# Fallback helpers for older Streamlit
+# Fallbacks para versiones de Streamlit
 # =======================
 def segmented_or_radio(label, options, default):
     if hasattr(st, "segmented_control"):
         return st.segmented_control(label, options=options, default=default)
-    else:
-        idx = options.index(default) if default in options else 0
-        return st.radio(label, options, index=idx, horizontal=True)
+    idx = options.index(default) if default in options else 0
+    return st.radio(label, options, index=idx, horizontal=True)
 
 def toggle_or_checkbox(label, value=False):
     if hasattr(st, "toggle"):
         return st.toggle(label, value=value)
-    else:
-        return st.checkbox(label, value=value)
+    return st.checkbox(label, value=value)
 
 def primary_button(label):
     try:
@@ -94,29 +81,51 @@ def primary_button(label):
 # =======================
 @st.cache_resource
 def load_model():
-    """Load model from local path, otherwise download from Google Drive (if DRIVE_ID provided)."""
-    if not MODEL_PATH.exists() or MODEL_PATH.stat().st_size == 0:
+    """Carga el modelo local; si no existe y hay DRIVE_ID, lo descarga de Google Drive."""
+    if (not MODEL_PATH.exists()) or MODEL_PATH.stat().st_size == 0:
         if DRIVE_URL:
             try:
-                import gdown  # must be present in requirements.txt
+                import gdown
             except Exception:
                 st.error(
-                    "No se encontró 'gdown'. Agregá 'gdown' a requirements.txt o "
-                    "instalalo en el entorno para poder descargar el modelo desde Drive."
+                    "No se encontró 'gdown'. Agregá 'gdown' a requirements.txt para descargar el modelo desde Drive."
                 )
                 raise
             with st.spinner("Descargando modelo desde Google Drive..."):
-                import gdown as _gdown
-                _gdown.download(DRIVE_URL, str(MODEL_PATH), quiet=False)
+                gdown.download(DRIVE_URL, str(MODEL_PATH), quiet=False)
         else:
             st.warning("No hay modelo local y no se definió DRIVE_ID en secrets. "
-                       "Cargá el pkl manualmente en /models o seteá DRIVE_ID.")
+                       "Cargá el pkl en /models o seteá DRIVE_ID.")
     try:
-        model = joblib.load(MODEL_PATH)
-        return model
+        return joblib.load(MODEL_PATH)
     except Exception as e:
         st.error(f"No se pudo cargar el modelo desde {MODEL_PATH}.\nDetalle: {e}")
         raise
+
+def haversine_distance_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+def route_distance_km(origin: str, dest: str) -> float:
+    if origin not in AIRPORT_COORDS or dest not in AIRPORT_COORDS:
+        return np.nan
+    (lat1, lon1) = AIRPORT_COORDS[origin]
+    (lat2, lon2) = AIRPORT_COORDS[dest]
+    return haversine_distance_km(lat1, lon1, lat2, lon2)
+
+def estimate_duration_min(distance_km: float, nonstop: bool = True) -> int:
+    if np.isnan(distance_km):
+        return 120
+    hours = distance_km / 800.0        # ~800 km/h
+    base_min = hours * 60 + 40         # taxi + seguridad
+    penalty = 0 if nonstop else 60     # escala
+    return int(round(base_min + penalty))
 
 # === introspección del modelo para saber columnas y categorías ===
 def infer_features_from_model(m):
@@ -145,24 +154,20 @@ def infer_features_from_model(m):
 
     return num_cols, cat_cols, airlines, dow_categories
 
-# Cargá el modelo y obtené la “firma” que espera
-model = load_model()
-num_cols, cat_cols, airlines_from_model, dow_categories = infer_features_from_model(model)
-
-def normalize_dow_value(date, dow_categories):
+def normalize_dow_value(date: dt.date, dow_categories):
     """
     Devuelve flight_dayofweek en el mismo formato que el entrenamiento.
-    Si el modelo fue entrenado con strings ('Mon'), devolvemos eso; si fue con 0..6, devolvemos int.
+    Si fue strings ('Mon'), devolvemos eso; si fue 0..6, devolvemos int.
     """
     sample = dow_categories[0]
     if isinstance(sample, str):
         return date.strftime("%a")  # 'Mon', 'Tue', ...
-    else:
-        return date.weekday()       # 0..6
+    return date.weekday()           # 0..6
 
 # === construir exactamente la fila de features que el modelo espera ===
-def build_features(origin, dest, flight_date, cabin_value, airline_code, is_refundable, nonstop):
-    # Nota: cabin_value NO se usa porque tu modelo v2 se entrenó sólo con coach
+def build_features(origin, dest, flight_date, cabin_value, airline_code, is_refundable, nonstop,
+                   num_cols, cat_cols, dow_categories):
+    # Nota: cabin_value NO se usa porque el modelo v2 se entrenó sólo con coach
     today = dt.date.today()
     days_to_departure = max((flight_date - today).days, 0)
 
@@ -200,72 +205,6 @@ def build_features(origin, dest, flight_date, cabin_value, airline_code, is_refu
         st.stop()
     return X[expected]
 
-
-def haversine_distance_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c
-
-def route_distance_km(origin: str, dest: str) -> float:
-    if origin not in AIRPORT_COORDS or dest not in AIRPORT_COORDS:
-        return np.nan
-    (lat1, lon1) = AIRPORT_COORDS[origin]
-    (lat2, lon2) = AIRPORT_COORDS[dest]
-    return haversine_distance_km(lat1, lon1, lat2, lon2)
-
-def estimate_duration_min(distance_km: float, nonstop: bool = True) -> int:
-    if np.isnan(distance_km):
-        return 120
-    hours = distance_km / 800.0
-    base_min = hours * 60 + 40
-    penalty = 0 if nonstop else 60
-    return int(round(base_min + penalty))
-
-def build_pred_rows(airlines_list):
-    # Derivados de la fecha seleccionada
-    flight_day = fecha.day
-    flight_month = fecha.month
-    dow_value = normalize_dow_value(fecha, dow_categories)
-    is_weekend = int(fecha.weekday() in (5, 6))  # sáb, dom
-    is_holiday_season = int(flight_month in (6, 7))  # regla que usaste al entrenar
-
-    base = {
-        "days_to_departure": days_to_departure,
-        "totalTravelDistance": distancia,
-        "duration_min": duracion,
-        "startingAirport": origen,
-        "destinationAirport": destino,
-        "isRefundable": int(refundable),
-        "isNonStop": int(nonstop),
-        "main_airline": None,                  # se setea abajo
-        "flight_month": flight_month,
-        "flight_dayofweek": dow_value,
-        "flight_day": flight_day,
-        "is_weekend": is_weekend,
-        "is_holiday_season": is_holiday_season,
-    }
-
-    rows = []
-    for a in airlines_list:
-        b = base.copy()
-        b["main_airline"] = a
-        rows.append(b)
-
-    dfp = pd.DataFrame(rows)
-
-    # Asegurar orden/columnas exactas que espera el modelo
-    expected_cols = list(num_cols) + list(cat_cols)
-    missing = [c for c in expected_cols if c not in dfp.columns]
-    if missing:
-        st.error(f"Faltan columnas para el modelo: {missing}")
-        st.stop()
-    return dfp[expected_cols]
-
 def predict(model, X: pd.DataFrame) -> float:
     y = model.predict(X)
     return float(y[0])
@@ -276,37 +215,17 @@ def format_currency(x: float) -> str:
     except Exception:
         return str(x)
 
-def infer_features_from_model(m):
-    """
-    Devuelve: (num_cols, cat_cols, airlines, dow_categories)
-    """
-    if "preprocess" not in m.named_steps:
-        st.error("El modelo no tiene paso 'preprocess'.")
-        st.stop()
+# =======================
+# Cargar modelo y leer su “firma”
+# =======================
+model = load_model()
+num_cols, cat_cols, airlines_from_model, dow_categories = infer_features_from_model(model)
 
-    ct = m.named_steps["preprocess"]
-    transformers = dict(ct.transformers_)
-    cat_cols = transformers["cat"][2]
-    num_cols = transformers["num"][2]
-
-    cat_pipe = transformers["cat"][1]
-    oh = cat_pipe.named_steps["onehot"]
-
-    # categorías de aerolíneas
-    idx_airline = cat_cols.index("main_airline")
-    airlines = list(oh.categories_[idx_airline])
-
-    # categorías de flight_dayofweek (para saber si espera 'Mon' o 0..6)
-    idx_dow = cat_cols.index("flight_dayofweek")
-    dow_categories = list(oh.categories_[idx_dow])
-
-    return num_cols, cat_cols, airlines, dow_categories
 # =======================
 # UI
 # =======================
 st.title("Vuelos")
 
-# Top controls
 trip_type = segmented_or_radio(
     "Tipo de viaje",
     options=["Ida y vuelta", "Solo ida"],
@@ -333,28 +252,24 @@ with c4:
         ret_date = None
         st.write(" ")
 
-# Second row: cabin, airline, nonstop/refundable
 c5, c6, c7, c8 = st.columns([1.2, 1.2, 1, 1])
 with c5:
-    cabin_label = st.selectbox("Cabina", list(CABINS.keys()), index=0)
-    cabin_value = CABINS[cabin_label]
+    cabin_label = st.selectbox("Cabina (visual)", list(CABINS.keys()), index=0)
+    cabin_value = CABINS[cabin_label]  # no afecta la predicción en v2
 with c6:
-    airline_label = st.selectbox("Aerolínea", list(AIRLINES.keys()), index=0)
-    airline_code = AIRLINES[airline_label]
+    airline_code = st.selectbox("Aerolínea (según entrenamiento)", options=sorted(airlines_from_model))
 with c7:
     nonstop = toggle_or_checkbox("Solo vuelos directos", value=True)
 with c8:
     is_refundable = toggle_or_checkbox("Reembolsable", value=False)
 
-# Load model (lazy)
-model = load_model()
+st.caption("⚠️ En este modelo v2, la cabina no participa de la predicción (se entrenó con 'coach').")
 
-# ACTIONS
 cta = primary_button("Explorar")
 
 if cta:
     try:
-        # Outbound
+        # Ida
         X_out = build_features(
             origin=origin,
             dest=dest,
@@ -363,27 +278,33 @@ if cta:
             airline_code=airline_code,
             is_refundable=is_refundable,
             nonstop=nonstop,
+            num_cols=num_cols,
+            cat_cols=cat_cols,
+            dow_categories=dow_categories,
         )
         price_out = predict(model, X_out)
 
-        # Return (if applicable)
+        # Vuelta (opcional)
         total_price = price_out
         if trip_type == "Ida y vuelta" and ret_date is not None:
             X_back = build_features(
-                origin=dest if dest in DESTS else dest,
+                origin=dest,
                 dest=origin,
                 flight_date=ret_date,
                 cabin_value=cabin_value,
                 airline_code=airline_code,
                 is_refundable=is_refundable,
                 nonstop=nonstop,
+                num_cols=num_cols,
+                cat_cols=cat_cols,
+                dow_categories=dow_categories,
             )
             price_back = predict(model, X_back)
             total_price += price_back
         else:
             price_back = None
 
-        # Show metrics
+        # Métricas
         st.subheader("Precio estimado")
         mc1, mc2, mc3 = st.columns(3)
         with mc1:
@@ -395,7 +316,7 @@ if cta:
 
         st.divider()
 
-        # Viz 1: Sensibilidad al anticipo (días)
+        # Viz 1: Sensibilidad a la anticipación (días)
         st.markdown("#### Cómo cambia el precio según la anticipación")
         days_range = np.arange(1, 181)  # 1..180 días
         X_sens = pd.concat([
@@ -407,6 +328,9 @@ if cta:
                 airline_code=airline_code,
                 is_refundable=is_refundable,
                 nonstop=nonstop,
+                num_cols=num_cols,
+                cat_cols=cat_cols,
+                dow_categories=dow_categories,
             )
             for d in days_range
         ], ignore_index=True)
@@ -427,54 +351,41 @@ if cta:
 
         st.divider()
 
-        # Viz 2: Comparativa de cabinas para esta ruta y fecha
-        st.markdown("#### Comparar por cabina (misma ruta y fecha)")
-        cabin_items = list(CABINS.items())
-        X_cab = pd.concat([
+        # Viz 2: Comparativa por aerolínea (misma ruta/fecha)
+        st.markdown("#### Comparar por aerolínea (misma ruta y fecha)")
+        airlines_to_compare = airlines_from_model  # podés limitar si son muchas
+        X_air = pd.concat([
             build_features(
                 origin=origin,
                 dest=dest,
                 flight_date=dep_date,
-                cabin_value=cval,
-                airline_code=airline_code,
+                cabin_value=cabin_value,
+                airline_code=a,
                 is_refundable=is_refundable,
                 nonstop=nonstop,
-            ).assign(cabin=clabel)
-            for clabel, cval in cabin_items
+                num_cols=num_cols,
+                cat_cols=cat_cols,
+                dow_categories=dow_categories,
+            ).assign(main_airline=a)
+            for a in airlines_to_compare
         ], ignore_index=True)
-        y_cab = model.predict(X_cab.drop(columns=["cabin"]))
-        df_cab = pd.DataFrame({"Cabina": X_cab["cabin"], "Precio": y_cab})
+        y_air = model.predict(X_air.drop(columns=["main_airline"]))
+        df_air = pd.DataFrame({"Aerolínea": X_air["main_airline"], "Precio": y_air})
         chart2 = (
-            alt.Chart(df_cab)
+            alt.Chart(df_air)
             .mark_bar()
             .encode(
-                x=alt.X("Cabina:N", sort=list(CABINS.keys())),
-                y=alt.Y("Precio:Q", title="Precio estimado (USD)"),
+                x=alt.X("Precio:Q", title="Precio estimado (USD)"),
+                y=alt.Y("Aerolínea:N", sort="-x"),
                 tooltip=[alt.Tooltip("Precio:Q", format="$.0f")],
             )
-            .properties(height=280)
+            .properties(height=320)
             .interactive()
         )
         st.altair_chart(chart2, use_container_width=True)
 
-        st.info("⚠️ Estimaciones basadas en un modelo entrenado. Distancia y duración son aproximadas y sólo para fines de demo.")
+        st.info("ℹ️ Estimaciones basadas en un modelo entrenado. Distancia y duración son aproximadas (demo).")
     except Exception as e:
         st.exception(e)
 else:
     st.caption("Elegí ruta, fechas y opciones. Luego presioná **Explorar** para estimar precios.")
-
-
-num_cols, cat_cols, airlines_from_model, dow_categories = infer_features_from_model(model)
-
-def normalize_dow_value(date, dow_categories):
-    """
-    Devuelve el valor de flight_dayofweek en el mismo formato que el entrenamiento.
-    Si el modelo fue entrenado con strings tipo 'Mon', devolvemos eso.
-    Si fue entrenado con números 0..6, devolvemos int.
-    """
-    sample = dow_categories[0]
-    if isinstance(sample, str):
-        # 'Mon', 'Tue', ... (en inglés)
-        return date.strftime("%a")  # Mon, Tue, Wed...
-    else:
-        return date.weekday()  # 0..6
