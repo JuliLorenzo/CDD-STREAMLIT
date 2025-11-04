@@ -143,34 +143,45 @@ def estimate_duration_min(distance_km: float, nonstop: bool = True) -> int:
     penalty = 0 if nonstop else 60
     return int(round(base_min + penalty))
 
-def build_features(
-    origin: str,
-    dest: str,
-    flight_date: dt.date,
-    cabin_value: str,
-    airline_code: str,
-    is_refundable: bool,
-    nonstop: bool,
-) -> pd.DataFrame:
-    today = dt.date.today()
-    days_to_departure = max((flight_date - today).days, 0)
-    distance_km = route_distance_km(origin, dest)
-    duration_min = estimate_duration_min(distance_km, nonstop=nonstop)
+def build_pred_rows(airlines_list):
+    # Derivados de la fecha seleccionada
+    flight_day = fecha.day
+    flight_month = fecha.month
+    dow_value = normalize_dow_value(fecha, dow_categories)
+    is_weekend = int(fecha.weekday() in (5, 6))  # sáb, dom
+    is_holiday_season = int(flight_month in (6, 7))  # regla que usaste al entrenar
 
-    row = {
+    base = {
         "days_to_departure": days_to_departure,
-        "totalTravelDistance": float(distance_km) if not np.isnan(distance_km) else 0.0,
-        "duration_min": int(duration_min),
-        "startingAirport": origin,
-        "destinationAirport": dest,
-        "isRefundable": bool(is_refundable),
-        "isNonStop": bool(nonstop),
-        "main_airline": airline_code,
-        "main_cabin": cabin_value,
-        "flight_month": int(flight_date.month),
-        "flight_dayofweek": int(flight_date.weekday()),
+        "totalTravelDistance": distancia,
+        "duration_min": duracion,
+        "startingAirport": origen,
+        "destinationAirport": destino,
+        "isRefundable": int(refundable),
+        "isNonStop": int(nonstop),
+        "main_airline": None,                  # se setea abajo
+        "flight_month": flight_month,
+        "flight_dayofweek": dow_value,
+        "flight_day": flight_day,
+        "is_weekend": is_weekend,
+        "is_holiday_season": is_holiday_season,
     }
-    return pd.DataFrame([row])
+
+    rows = []
+    for a in airlines_list:
+        b = base.copy()
+        b["main_airline"] = a
+        rows.append(b)
+
+    dfp = pd.DataFrame(rows)
+
+    # Asegurar orden/columnas exactas que espera el modelo
+    expected_cols = list(num_cols) + list(cat_cols)
+    missing = [c for c in expected_cols if c not in dfp.columns]
+    if missing:
+        st.error(f"Faltan columnas para el modelo: {missing}")
+        st.stop()
+    return dfp[expected_cols]
 
 def predict(model, X: pd.DataFrame) -> float:
     y = model.predict(X)
@@ -343,3 +354,44 @@ if cta:
         st.exception(e)
 else:
     st.caption("Elegí ruta, fechas y opciones. Luego presioná **Explorar** para estimar precios.")
+
+def infer_features_from_model(m):
+    """
+    Devuelve: (num_cols, cat_cols, airlines, dow_categories)
+    """
+    if "preprocess" not in m.named_steps:
+        st.error("El modelo no tiene paso 'preprocess'.")
+        st.stop()
+
+    ct = m.named_steps["preprocess"]
+    transformers = dict(ct.transformers_)
+    cat_cols = transformers["cat"][2]
+    num_cols = transformers["num"][2]
+
+    cat_pipe = transformers["cat"][1]
+    oh = cat_pipe.named_steps["onehot"]
+
+    # categorías de aerolíneas
+    idx_airline = cat_cols.index("main_airline")
+    airlines = list(oh.categories_[idx_airline])
+
+    # categorías de flight_dayofweek (para saber si espera 'Mon' o 0..6)
+    idx_dow = cat_cols.index("flight_dayofweek")
+    dow_categories = list(oh.categories_[idx_dow])
+
+    return num_cols, cat_cols, airlines, dow_categories
+
+num_cols, cat_cols, airlines_from_model, dow_categories = infer_features_from_model(modelo)
+
+def normalize_dow_value(date, dow_categories):
+    """
+    Devuelve el valor de flight_dayofweek en el mismo formato que el entrenamiento.
+    Si el modelo fue entrenado con strings tipo 'Mon', devolvemos eso.
+    Si fue entrenado con números 0..6, devolvemos int.
+    """
+    sample = dow_categories[0]
+    if isinstance(sample, str):
+        # 'Mon', 'Tue', ... (en inglés)
+        return date.strftime("%a")  # Mon, Tue, Wed...
+    else:
+        return date.weekday()  # 0..6
